@@ -157,10 +157,83 @@ namespace recorder {
     static int  g_last_commit_flags       = 0;
     static bool g_last_commit_flags_known = false;
 
+    // ─── boundary input scrub ─────────────────────────────────────────
+    // The savestate captures the DUCK hidden-state (FL_DUCKING + duck-hull
+    // transition + m_flDucktime) which input-replay can't reproduce, so a
+    // crouch INTO a save corrupts it; and a strafe (A/D) held THROUGH a load
+    // applies side-move from a mid-transition. Fix (Talan's debugging): scrub
+    // exactly those inputs at the boundaries — no crouch a couple ticks around
+    // the SAVE, and zero A/D + crouch a couple ticks after a LOAD. Baked into
+    // the tape so playback matches. Everything else is left untouched.
+    // Save side: fire the save IMMEDIATELY on the first tick (never delay it —
+    // delaying slid the savestate ~150 units downrange at surf speed and wrecked
+    // every stitch) while blocking crouch for these ticks around it.
+    static constexpr int SAVE_SCRUB_TICKS = 2;
+    // Load side: zero A/D + crouch this many ticks, starting on the FIRST tick
+    // after release. Wide enough to bracket the ±1 tick of server jitter in
+    // exactly-when-movement-resumes — a fixed one-tick window caught the resume
+    // only sometimes (worked one run, missed the next).
+    static constexpr int LOAD_SCRUB_TICKS = 3;
+    static constexpr int IN_DUCK_B      = 1 << 2;
+    static constexpr int IN_MOVELEFT_B  = 1 << 9;
+    static constexpr int IN_MOVERIGHT_B = 1 << 10;
+
+    static bool g_save_scrub_pending = false;  // E pressed, delayed save not fired yet
+    static int  g_save_scrub_left    = 0;      // crouch-blocked ticks around the save
+    static bool g_load_scrub_held    = false;  // load key HELD (frozen at lock) — scrub every tick
+    static int  g_load_scrub_left    = 0;      // A/D+crouch-scrubbed ticks after release
+
+    // Called by the commit hotkey (when scrub is on) instead of firing the save
+    // immediately — the recorder blocks crouch for a couple ticks, fires the
+    // save mid-block, so the saved state has no active duck.
+    void request_commit_scrub() {
+        std::lock_guard<std::recursive_mutex> lk(g_mtx);
+        if (g_mode == Mode::Recording) {
+            g_save_scrub_pending = true;
+            g_save_scrub_left    = SAVE_SCRUB_TICKS;
+        }
+    }
+
+    // Called when the load key is PRESSED (Momentum freezes you at the lock
+    // while it's held). Start scrubbing A/D + crouch immediately so no strafe/
+    // duck is carried THROUGH the freeze — the input the server sees each tick
+    // of the hold is clean, not just after release.
+    void begin_load_scrub() {
+        std::lock_guard<std::recursive_mutex> lk(g_mtx);
+        if (g_mode == Mode::Recording) g_load_scrub_held = true;
+    }
+
+    // Called when the load key is RELEASED (movement starts on release). End the
+    // held scrub and keep zeroing A/D + crouch for LOAD_SCRUB_TICKS more ticks so
+    // the retry resumes clean too.
+    void arm_load_scrub() {
+        std::lock_guard<std::recursive_mutex> lk(g_mtx);
+        g_load_scrub_held = false;
+        if (g_mode == Mode::Recording) g_load_scrub_left = LOAD_SCRUB_TICKS;
+    }
+
+    // ─── rewind mode ──────────────────────────────────────────────────
+    // Instead of recording every failed attempt and cutting them out at
+    // playback (which the stitcher can't untangle once you've retried a spot
+    // many times), Q THROWS AWAY the failed attempt: truncate the tape back to
+    // the last commit, let the savestate teleport land, then keep recording.
+    // The tape becomes one continuous run of only good attempts — no cuts, no
+    // matcher, nothing to break.
+    static bool        g_rewind_await = false;      // waiting for the teleport to land
+    static hooks::Vec3 g_rewind_target_pos = {0,0,0};
+    static void trim_parallel_arrays(size_t n);     // defined lower
+
     int   commits_made()                  { return g_commits_made; }
     float current_stitch_dist()           { return g_current_stitch_dist; }
     float min_stitch_dist_since_commit()  { return g_min_stitch_dist; }
     bool  last_commit_in_air()            { return g_last_commit_in_air; }
+
+    // FL_DUCKING was set when the last save fired. The savestate captures the
+    // duck hidden-state (duck hull + m_flDucktime) that pure input replay can
+    // never reproduce, so a crouched commit is guaranteed to break on playback.
+    bool  last_commit_crouched() {
+        return g_last_commit_flags_known && (g_last_commit_flags & FL_DUCKING);
+    }
 
     void commit() {
         std::lock_guard<std::recursive_mutex> lk(g_mtx);
@@ -223,6 +296,8 @@ namespace recorder {
             return;
         }
         push_meta(EventType::Teleport, "mom_savestate_load");
+        // (The load-side A/D+crouch scrub is armed on the load-key RELEASE, in
+        // the hotkey handler — Momentum only starts you moving on release.)
         hooks::log("[Recorder] Q rollback -> active idx=%d (commit frame=%zu)",
                    g_active_commit_idx,
                    g_events[g_active_commit_idx].frame_index);
@@ -339,7 +414,8 @@ namespace recorder {
         return { b.x - a.x, b.y - a.y, b.z - a.z };
     }
 
-    static AutoMatch auto_match_delay(size_t target_frame, size_t event_frame) {
+    static AutoMatch auto_match_delay(size_t target_frame, size_t event_frame,
+                                      size_t commit_cap) {
         AutoMatch r{ target_frame, event_frame, 1e30f, 1e30f, 0.f, false, 0.f, false, 0, 0, false };
         if (g_positions.size() < 2 || event_frame >= g_positions.size()) return r;
 
@@ -369,7 +445,11 @@ namespace recorder {
         size_t c_lo = target_frame > COMMIT_LOOK_BEFORE ? target_frame - COMMIT_LOOK_BEFORE : 0;
         size_t c_hi = std::min({ g_positions.size(),
                                  target_frame + COMMIT_LOOK_AFTER + 1,
-                                 event_frame + 1 }); // CRITICAL: never past the Q-press
+                                 event_frame + 1,   // never past THIS Q-press
+                                 commit_cap + 1 }); // never past the FIRST Q after the commit —
+                                                    // frames beyond it are retry clones (same
+                                                    // restored state) that produce false err=0
+                                                    // matches when you retry a spot repeatedly.
         if (c_hi <= c_lo) return r;
 
         // Small guard after the Q-press for teleport-tick jitter only. The
@@ -483,7 +563,14 @@ namespace recorder {
                 float qx = q_pos.x - p_j.x, qy = q_pos.y - p_j.y, qz = q_pos.z - p_j.z;
                 float q_d2 = qx*qx + qy*qy + qz*qz;
                 if (q_d2 > r.best_q_dist) r.best_q_dist = q_d2;
-                if (q_d2 < far_sq) continue;
+                // Far-guard rejects same-spot SHADOW matches (a coincidental
+                // ballistic-clone frame where the Q-press sat on the loc). But
+                // the resume-floor frame is the REAL teleport landing, already
+                // pinpointed by the discontinuity scan above — never a clone —
+                // so exempt it. Without this, a short retry (Q pressed again
+                // before travelling 50u from the loc) loses its perfect snap and
+                // falls back to a fixed-delay guess that seeds drift.
+                if (q_d2 < far_sq && i != r.resume) continue;
 
                 // Hidden-state guard: same pos+vel with different ground/
                 // duck/water bits is a DIFFERENT physics state (e.g. the
@@ -596,9 +683,22 @@ namespace recorder {
             if (active < 0) continue;
             size_t target_frame = g_events[active].frame_index;
 
+            // The first rollback (any Q/prev/next) after the active commit. The
+            // pre-fail path structurally ends there — everything after it is a
+            // retry that restored from the savestate, so those frames are clones
+            // of the commit-side path and must not be matchable, or the matcher
+            // false-matches them as a perfect (err=0) cut.
+            size_t commit_cap = g_tape.size();
+            for (size_t k = static_cast<size_t>(active) + 1; k < g_events.size(); ++k) {
+                if (g_events[k].kind != EventType::Saveloc) {
+                    commit_cap = g_events[k].frame_index;
+                    break;
+                }
+            }
+
             bool auto_ok = false;
             if (can_auto) {
-                AutoMatch m = auto_match_delay(target_frame, ev.frame_index);
+                AutoMatch m = auto_match_delay(target_frame, ev.frame_index, commit_cap);
                 if (m.no_teleport) {
                     // Dropped teleport — ignore the event completely. The
                     // fallback window must NOT run either: it would cut real
@@ -843,6 +943,11 @@ namespace recorder {
         g_active_commit_idx = -1;
         g_head = 0;
         g_speed_accum = 0.f;
+        g_rewind_await = false;
+        g_save_scrub_pending = false;
+        g_save_scrub_left = 0;
+        g_load_scrub_held = false;
+        g_load_scrub_left = 0;
 
         g_start_saved = hooks::get_local_player_pos(g_start_pos);
 
@@ -982,6 +1087,7 @@ namespace recorder {
         hooks::log("[Recorder] STOP  tape_frames=%zu  events=%zu",
                    g_tape.size(), g_events.size());
         g_mode = Mode::Idle; g_head = 0; g_speed_accum = 0.f;
+        g_rewind_await = false;
     }
 
     // Keep every parallel physics array in lockstep with the tape after an
@@ -1162,6 +1268,32 @@ namespace recorder {
         }
 
         if (g_mode == Mode::Recording) {
+            // Save-side crouch scrub: block crouch for a couple ticks around the
+            // save (fire it mid-block) so the saved state has no active duck.
+            if (g_save_scrub_pending) {
+                cmd->buttons &= ~IN_DUCK_B;
+                cmd->upmove   = 0.f;
+                // Fire on the FIRST tick so the savestate lands exactly where you
+                // pressed E (no downrange slide). Crouch is still blocked on this
+                // tick and the next.
+                if (g_save_scrub_left == SAVE_SCRUB_TICKS) {
+                    note_saveloc_fired();
+                    hooks::execute_server_cmd("mom_savestate_create");
+                    commit();
+                    hooks::log("[Scrub] save fired (crouch blocked %d ticks)", SAVE_SCRUB_TICKS);
+                }
+                if (--g_save_scrub_left <= 0) g_save_scrub_pending = false;
+            }
+            // Load-side scrub: zero A/D + crouch for the ENTIRE time the load key
+            // is held (frozen at the lock) AND for LOAD_SCRUB_TICKS after release,
+            // so no strafe/duck is carried into, through, or out of the load.
+            if (g_load_scrub_held || g_load_scrub_left > 0) {
+                cmd->sidemove = 0.f;
+                cmd->buttons &= ~(IN_MOVELEFT_B | IN_MOVERIGHT_B | IN_DUCK_B);
+                cmd->upmove   = 0.f;
+                if (!g_load_scrub_held && g_load_scrub_left > 0) --g_load_scrub_left;
+            }
+
             Frame f = from_cmd(cmd);
             g_tape.push_back(f);
             // Keep the physics-state arrays parallel to g_tape — one entry

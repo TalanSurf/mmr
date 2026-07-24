@@ -41,6 +41,9 @@ namespace menu {
     extern bool g_rmb_overdub;        // right-click during playback = overdub from current frame
     extern bool g_compact_hud;        // shrink the status chip
     extern bool g_hud_top_left;       // move the status chip to the top-left
+    extern bool g_commit_freeze;      // freeze input around each commit
+    extern int  g_commit_freeze_ticks;// freeze-window length in ticks
+    extern bool g_rewind_mode;        // Q discards failed attempt (continuous tape, no stitching)
 
     // Extra pitch offset (degrees) applied on top of the recorded pitch
     // when backwards playback is on. Negative = look down at the ground.

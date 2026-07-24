@@ -33,6 +33,9 @@ namespace menu {
     bool g_rmb_overdub           = false;  // right-click during playback = take over + re-record from here
     bool g_compact_hud           = false;  // shrink the REC/segment status chip
     bool g_hud_top_left          = false;  // move the status chip to the top-left corner
+    bool g_commit_freeze         = false;  // freeze input for a few ticks around each commit
+    int  g_commit_freeze_ticks   = 3;      // freeze-window length (save fires mid-window)
+    bool g_rewind_mode           = false;  // Q discards the failed attempt (no stitching)
 
     // ─── keybinds ─────────────────────────────────────────────────────
     struct Bind { const char* label; int def_vk; int vk; };
@@ -127,6 +130,9 @@ namespace menu {
         kv("rmb_overdub",     g_rmb_overdub);
         kv("compact_hud",     g_compact_hud);
         kv("hud_top_left",    g_hud_top_left);
+        kv("commit_freeze",   g_commit_freeze);
+        kv("freeze_ticks",    g_commit_freeze_ticks);
+        kv("rewind_mode",     g_rewind_mode);
         for (int i = 0; i < BindCount; ++i) {
             std::snprintf(line, sizeof(line), "bind_%d=%d\n", i, g_binds[i].vk);
             out += line;
@@ -151,6 +157,9 @@ namespace menu {
         else if (!std::strcmp(key, "rmb_overdub"))    g_rmb_overdub           = v != 0;
         else if (!std::strcmp(key, "compact_hud"))    g_compact_hud           = v != 0;
         else if (!std::strcmp(key, "hud_top_left"))   g_hud_top_left          = v != 0;
+        else if (!std::strcmp(key, "commit_freeze"))  g_commit_freeze         = v != 0;
+        else if (!std::strcmp(key, "freeze_ticks"))   g_commit_freeze_ticks   = v < 1 ? 1 : (v > 12 ? 12 : v);
+        else if (!std::strcmp(key, "rewind_mode"))    g_rewind_mode           = v != 0;
         else if (!std::strncmp(key, "bind_", 5)) {
             int i = std::atoi(key + 5);
             if (i >= 0 && i < BindCount && v != 0)
@@ -484,7 +493,6 @@ namespace menu {
                 int   commits    = recorder::commits_made();
                 float cur_dist   = recorder::current_stitch_dist();
                 float min_dist   = recorder::min_stitch_dist_since_commit();
-                bool  in_air     = recorder::last_commit_in_air();
 
                 if (commits == 0) {
                     vcol = REC_RED;
@@ -492,13 +500,21 @@ namespace menu {
                     std::snprintf(sub_line, sizeof(sub_line),
                                   "frame %zu   press %s to commit a segment",
                                   recorder::tape_size(), bind_key_name(BindCommit));
+                } else if (recorder::last_commit_crouched()) {
+                    // Crouch at the save = FL_DUCKING baked into the savestate
+                    // that input replay can't reproduce. This segment is doomed —
+                    // say so loudly, in red.
+                    vcol = REC_RED;
+                    std::snprintf(big_line, sizeof(big_line),
+                                  "WARNING: YOU CROUCHED — SEGMENT WILL BREAK");
+                    std::snprintf(sub_line, sizeof(sub_line),
+                                  "rollback and re-commit this segment without crouching");
                 } else {
                     // Verdict on WHAT WE CAN OBSERVE — retry re-acquires
                     // pos+vel+flags similar to the E-press state.
                     const char* verdict;
                     if      (min_dist > 500.f) { verdict = "NO MATCH — rollback + redo"; vcol = REC_RED; }
                     else if (min_dist > 100.f) { verdict = "RETRY CATCHING UP";          vcol = WARN_YLW; }
-                    else if (in_air)           { verdict = "MATCHED (air commit — risky)"; vcol = WARN_YLW; }
                     else                        { verdict = "MATCHED";                    vcol = PLAY_GRN; }
 
                     std::snprintf(big_line, sizeof(big_line),
@@ -731,16 +747,18 @@ namespace menu {
              "back to that start for an exact entry — the log warns if "
              "you're off.");
 
+        ImGui::Checkbox("clean save/load inputs (crouch + strafe)", &g_commit_freeze);
+        hint("Fixes the two states that corrupt a savestate: blocks CROUCH for a "
+             "couple ticks around the save (so no duck-transition is baked in), "
+             "and zeroes A/D + crouch for a couple ticks right after you load a "
+             "savestate. Lets you commit and retry while moving/turning. Leave "
+             "on. Baked into the tape, so playback matches.");
+
         {
             int cuts = recorder::stitch_cut_count();
             if (cuts > 0) {
-                int risky = recorder::stitch_risky_count();
-                ImGui::TextColored(risky ? ImVec4(1.f, 0.75f, 0.25f, 1.f)
-                                         : ImVec4(0.4f, 0.9f, 0.4f, 1.f),
-                                   "stitch report: %d cut(s), %d risky, worst err %.0f%s",
-                                   cuts, risky, recorder::stitch_worst_err(),
-                                   recorder::tape_has_phys_state()
-                                       ? "" : "  (old tape - no phys data)");
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.f),
+                                   "stitch report: %d cut(s) stitched", cuts);
             } else {
                 ImGui::TextDisabled("stitch report appears here after a playback with cuts.");
             }
@@ -988,7 +1006,7 @@ namespace menu {
         section("WORKFLOW");
         ImGui::BulletText("record, commit at safe spots, rollback fails, stop.");
         ImGui::BulletText("mom_savestate_first back to the run's FIRST savestate, then play.");
-        ImGui::BulletText("green stitch report = clean run; risky cuts name the segment to redo.");
+        ImGui::BulletText("never crouch into a commit — the red warning means redo that segment.");
 
         section("SYSTEM");
         ImGui::TextDisabled("log:   C:\\Users\\Talan\\momentum-menu\\momentum_menu.log");

@@ -1283,10 +1283,12 @@ static void* find_g_pClientMode() {
 // load is a PLAIN concommand that teleports on execution — the earlier
 // +/-mom_savestate_load pair was the button-bind wrapper, and firing +/- in
 // one frame cancelled the teleport. Using the plain command fixes Q.
-static constexpr const char* CMD_SS_CREATE = "mom_savestate_create";
-static constexpr const char* CMD_SS_LOAD   = "mom_savestate_load";
-static constexpr const char* CMD_SS_PREV   = "mom_savestate_prev";
-static constexpr const char* CMD_SS_NEXT   = "mom_savestate_next";
+static constexpr const char* CMD_SS_CREATE   = "mom_savestate_create";
+static constexpr const char* CMD_SS_LOAD     = "mom_savestate_load";   // plain (instant)
+static constexpr const char* CMD_SS_LOAD_DN  = "+mom_savestate_load";  // hold = freeze at lock
+static constexpr const char* CMD_SS_LOAD_UP  = "-mom_savestate_load";  // release = go
+static constexpr const char* CMD_SS_PREV     = "mom_savestate_prev";
+static constexpr const char* CMD_SS_NEXT     = "mom_savestate_next";
 
 
 static LRESULT CALLBACK hk_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1336,25 +1338,32 @@ static LRESULT CALLBACK hk_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 // Commit segment: create a savestate so the game remembers the
                 // spot for a later teleport, AND pin a tape checkpoint.
                 if (recorder::mode() == recorder::Mode::Recording) {
-                    recorder::note_saveloc_fired();
-                    hooks::execute_server_cmd(CMD_SS_CREATE);
-                    recorder::commit();
-                    log("[Hotkey] commit -> %s + tape marker", CMD_SS_CREATE);
+                    if (menu::g_commit_freeze) {
+                        recorder::request_commit_scrub();  // recorder fires the save (crouch blocked)
+                        log("[Hotkey] commit (scrub) requested");
+                    } else {
+                        recorder::note_saveloc_fired();
+                        hooks::execute_server_cmd(CMD_SS_CREATE);
+                        recorder::commit();
+                        log("[Hotkey] commit -> %s + tape marker", CMD_SS_CREATE);
+                    }
                 }
             } else if (!repeat && vk == menu::bind_vk(menu::BindRollback)) {
-                // Teleport to the CURRENT savestate. Plain concommand that
-                // teleports on execution. Recording pins the rollback marker;
-                // Idle just teleports (handy for walking back to a loc before
-                // PLAY). Playback ignores the key — a stray teleport wrecks
-                // runs.
+                // Load the CURRENT savestate. With clean-inputs on we use the
+                // +command (hold = frozen at the lock, release = go), and the
+                // A/D+crouch scrub is armed on the key RELEASE below. With it
+                // off, the plain command teleports instantly. Recording pins the
+                // rollback marker; Idle just teleports. Playback ignores the key.
+                const char* loadcmd = menu::g_commit_freeze ? CMD_SS_LOAD_DN : CMD_SS_LOAD;
                 recorder::Mode m = recorder::mode();
                 if (m == recorder::Mode::Recording) {
-                    hooks::execute_server_cmd(CMD_SS_LOAD);
+                    hooks::execute_server_cmd(loadcmd);
                     recorder::rollback();
-                    log("[Hotkey] rollback -> %s + tape marker", CMD_SS_LOAD);
+                    if (menu::g_commit_freeze) recorder::begin_load_scrub();  // scrub A/D+crouch while held
+                    log("[Hotkey] rollback -> %s + tape marker", loadcmd);
                 } else if (m == recorder::Mode::Idle) {
-                    hooks::execute_server_cmd(CMD_SS_LOAD);
-                    log("[Hotkey] %s (idle)", CMD_SS_LOAD);
+                    hooks::execute_server_cmd(loadcmd);
+                    log("[Hotkey] %s (idle)", loadcmd);
                 }
             } else if (!repeat && vk == menu::bind_vk(menu::BindPrevloc)) {
                 // Move the RECORDER's selected segment back one — over the
@@ -1366,6 +1375,25 @@ static LRESULT CALLBACK hk_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 // Move the RECORDER's selected segment forward one.
                 recorder::rollback_next();
                 log("[Hotkey] next segment");
+            }
+        }
+    }
+
+    // Load-key RELEASE (clean-inputs mode): the +command held you frozen at the
+    // lock; releasing it (-command) unfreezes and starts movement. Fire the
+    // release and arm the A/D+crouch scrub for the ticks right after.
+    if (menu::g_commit_freeze &&
+        (msg == WM_KEYUP || msg == WM_XBUTTONUP || msg == WM_MBUTTONUP)) {
+        int uvk;
+        if (msg == WM_KEYUP)          uvk = static_cast<int>(wp);
+        else if (msg == WM_MBUTTONUP) uvk = VK_MBUTTON;
+        else                          uvk = (HIWORD(wp) == XBUTTON2) ? VK_XBUTTON2 : VK_XBUTTON1;
+        if (uvk == menu::bind_vk(menu::BindRollback)) {
+            recorder::Mode m = recorder::mode();
+            if (m == recorder::Mode::Recording || m == recorder::Mode::Idle) {
+                hooks::execute_server_cmd(CMD_SS_LOAD_UP);   // release = go
+                recorder::arm_load_scrub();
+                log("[Hotkey] load released -> %s + scrub armed", CMD_SS_LOAD_UP);
             }
         }
     }

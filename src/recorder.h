@@ -45,6 +45,20 @@ namespace recorder {
     //                 recorded since the last E, so a stitched run only
     //                 contains the successful segments.
     void commit();
+    // Freeze the input for a few ticks around the next save and fire the save
+    // mid-freeze (baked into the tape). Steadies velocity across the save so a
+    // mid-carve commit still stitches clean. Called by the commit hotkey when
+    // commit-freeze is enabled, instead of the immediate commit path.
+    // Delayed commit that blocks crouch around the save (and triggers the
+    // load-side A/D+crouch scrub on Q). Called by the commit hotkey when the
+    // clean-inputs option is on, instead of the immediate commit path.
+    void request_commit_scrub();
+    // Called when the load key is PRESSED — starts scrubbing A/D+crouch while
+    // held (frozen at the lock), so nothing is carried through the freeze.
+    void begin_load_scrub();
+    // Called when the load key is RELEASED — keeps zeroing A/D+crouch for the
+    // ticks right after (Momentum only starts you moving on release).
+    void arm_load_scrub();
     void rollback();       // Q — targets the SELECTED commit (+mom_savestate_load)
     void rollback_prev();  // selects one segment earlier (works Recording or Idle)
     void rollback_next();  // selects one segment later (works Recording or Idle)
@@ -82,6 +96,9 @@ namespace recorder {
     float current_stitch_dist();
     float min_stitch_dist_since_commit();
     bool  last_commit_in_air();
+    // FL_DUCKING was set at the last commit — the savestate baked in a duck
+    // state replay can't reproduce, so that segment will break. UI flags it red.
+    bool  last_commit_crouched();
 
     // Playback drift telemetry — measured live and updated each tick while
     // the tape is playing. `current_segment` = how many E-presses we've
